@@ -7,7 +7,7 @@
  * После этого пакет передается обратно в поток и там отсылается обратно
  * клиенту.
  *
- * $Id: ex2.c,v 1.5 2022/09/08 13:55:15 swp Exp $
+ * $Id: ex2.c,v 1.6 2022/09/10 02:12:51 swp Exp $
  */
 
 /* 
@@ -300,6 +300,11 @@ int main(int argc, char *argv[]) {
     if (ev_is_active(thr1_accept_ev))
         ev_io_stop(thr1_loop, thr1_accept_ev);
     close(sock);
+    for (int fd; !sockq_dequeue(&fd); )
+        close(fd);
+    for (int i = 0; i < sizeof iobq/sizeof iobq[0]; i++)
+        for (struct iob *iob; (iob = iobq_dequeue(iobq + i)) != NULL; )
+            iob_destroy(iob);
     for (struct io *p; p = LIST_FIRST(&ioq), p; )
         io_detach(p);
     if (ev_is_active(thr1_watchdog_ev))
