@@ -180,11 +180,11 @@ int main(int argc, char *argv[]) {
         goto L_err;
     }
     if (pcap_setdirection(ifcap[0], PCAP_D_IN) == PCAP_ERROR) {
-        elog("pcap_setfirector(%s, PCAP_D_IN): %s\n", ifname[0], pcap_geterr(ifcap[0]));
+        elog("pcap_setdirection(%s, PCAP_D_IN): %s\n", ifname[0], pcap_geterr(ifcap[0]));
         goto L_err;
     }
     if (pcap_setdirection(ifcap[1], 0) == PCAP_ERROR) {
-        elog("pcap_setfirector(%s, 0): %s\n", ifname[1], pcap_geterr(ifcap[1]));
+        elog("pcap_setdirection(%s, 0): %s\n", ifname[1], pcap_geterr(ifcap[1]));
         goto L_err;
     }
 
