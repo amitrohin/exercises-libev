@@ -8,7 +8,7 @@
  * Отправка осуществляется тоже в сыром виде в выходящий интерфейс, с
  * формированием L2 заголовков, подсчетом сумм итд.
  *
- * $Id: ex3.c,v 1.1.1.1 2022/09/11 18:44:40 swp Exp $
+ * $Id: ex3.c,v 1.3 2022/09/12 07:56:06 swp Exp $
  */
 
 #include <stddef.h>
@@ -58,7 +58,6 @@ STAILQ_HEAD(pcbq, pcb);
 static pthread_mutex_t pcbq_mtx[2][1] = {{PTHREAD_MUTEX_INITIALIZER}, {PTHREAD_MUTEX_INITIALIZER}};
 static struct pcbq pcbq[2][1] = {{STAILQ_HEAD_INITIALIZER(pcbq[0][0])}, {STAILQ_HEAD_INITIALIZER(pcbq[1][0])}};
 
-
 static struct pcb *         pcb_create(struct timeval *ts, int len, const u_char pkt[len]);
 static void                 pcb_destroy(struct pcb *pcb);
 
@@ -78,6 +77,7 @@ static struct ev_loop *     thr1_loop;
 static struct ev_periodic   thr1_watchdog_ev[1];
 static struct ev_signal     thr1_signal_ev[1];
 static struct ev_io         thr1_precv_ev[1];
+static struct ev_io         thr1_psend_ev[1];
 static struct ev_async      thr1_pcbq_async_ev[1];
 
 static struct ev_loop *     thr2_loop;
@@ -85,6 +85,7 @@ static struct ev_async      thr2_exit_async_ev[1];
 static struct ev_async      thr2_pcbq_async_ev[1];
 
 static void                 thr1_precv_cb(struct ev_loop *loop, struct ev_io *w, int revents);
+static void                 thr1_psend_cb(struct ev_loop *loop, struct ev_io *w, int revents);
 static void                 thr1_pcbq_async_cb(struct ev_loop *loop, struct ev_async *w, int revents);
 static void                 thr2_pcbq_async_cb(struct ev_loop *loop, struct ev_async *w, int revents);
 
@@ -110,8 +111,8 @@ static const char *ifname[2];
 static char udpfltr_default[] = "udp", *udpfltr = udpfltr_default;
 static struct bpf_program fpbuf, *fp;
 static pcap_t *ifcap[2];
-static int fdcap = -1;
-static char errbuf[PCAP_ERRBUF_SIZE];   /* thr1 */
+static int fdcap[2] = {-1, -1};
+static char errbuf[PCAP_ERRBUF_SIZE];
 
 int main(int argc, char *argv[]) {
     progname = ({ char *p = strrchr(argv[0], '/'); p ? p+1 : argv[0]; });
@@ -161,6 +162,22 @@ int main(int argc, char *argv[]) {
             elog("pcap_setnonblock(%s): %s\n", ifname[i], errbuf);
             goto L_err;
         }
+        int fd = pcap_get_selectable_fd(ifcap[i]);
+        if (fd == PCAP_ERROR) {
+            elog("pcap_get_selectable_fd(%s): unsupported event driven io.\n", ifname[0]);
+            goto L_err;
+        }
+        fdcap[i] = fd;
+        // dlog("fdcap[%d]: %d\n", i, fdcap[i]);
+    }
+    if (pcap_compile(ifcap[0], &fpbuf, udpfltr, 0, 0) == PCAP_ERROR) {
+        elog("pcap_compile(): %s: %s\n", udpfltr, pcap_geterr(ifcap[0]));
+        goto L_err;
+    }
+    fp = &fpbuf;
+    if (pcap_setfilter(ifcap[0], fp) == PCAP_ERROR) {
+        elog("pcap_setfilter(): %s\n", pcap_geterr(ifcap[0]));
+        goto L_err;
     }
     if (pcap_setdirection(ifcap[0], PCAP_D_IN) == PCAP_ERROR) {
         elog("pcap_setfirector(%s, PCAP_D_IN): %s\n", ifname[0], pcap_geterr(ifcap[0]));
@@ -171,22 +188,7 @@ int main(int argc, char *argv[]) {
         goto L_err;
     }
 
-    if (pcap_compile(ifcap[0], &fpbuf, udpfltr, 0, 0) == PCAP_ERROR) {
-        elog("pcap_compile(): %s: %s\n", udpfltr, pcap_geterr(ifcap[0]));
-        goto L_err;
-    }
-    fp = &fpbuf;
-    if (pcap_setfilter(ifcap[0], fp) == PCAP_ERROR) {
-        elog("pcap_setfilter(): %s\n", pcap_geterr(ifcap[0]));
-        goto L_err;
-    }
-    fdcap = pcap_get_selectable_fd(ifcap[0]);
-    if (fdcap == PCAP_ERROR) {
-        elog("pcap_get_selectable_fd(%s): unsupported event driven io.\n", ifname[0]);
-        goto L_err;
-    }
-
-    thr1_loop = EV_DEFAULT;
+    thr1_loop = ev_default_loop(EVBACKEND_SELECT);
     assert(thr1_loop);
     ev_periodic_init(thr1_watchdog_ev, thr1_watchdog_cb, 0, 0.1, NULL);
     ev_periodic_start(thr1_loop, thr1_watchdog_ev);
@@ -194,10 +196,11 @@ int main(int argc, char *argv[]) {
     ev_signal_start(thr1_loop, thr1_signal_ev);
     ev_async_init(thr1_pcbq_async_ev, thr1_pcbq_async_cb);
     ev_async_start(thr1_loop, thr1_pcbq_async_ev);
-    ev_io_init(thr1_precv_ev, thr1_precv_cb, fdcap, EV_READ);
+    ev_io_init(thr1_precv_ev, thr1_precv_cb, fdcap[0], EV_READ);
     ev_io_start(thr1_loop, thr1_precv_ev);
+    ev_io_init(thr1_psend_ev, thr1_psend_cb, fdcap[1], EV_WRITE);
 
-    thr2_loop = ev_loop_new(0);
+    thr2_loop = ev_loop_new(EVBACKEND_SELECT);
     assert(thr2_loop);
     ev_async_init(thr2_exit_async_ev, thr2_exit_async_cb);
     ev_async_start(thr2_loop, thr2_exit_async_ev);
@@ -388,14 +391,11 @@ static void thr2_pcbq_async_cb(struct ev_loop *loop, struct ev_async *w, int rev
         {STAILQ_HEAD_INITIALIZER(q[0][0])},
         {STAILQ_HEAD_INITIALIZER(q[1][0])}
     };
-
-    dlog("\n");
-
     pthread_mutex_lock(pcbq_mtx[0]);
     pcbq_swap(pcbq[0], q[0]);
     pthread_mutex_unlock(pcbq_mtx[0]);
     for (struct pcb *pcb; (pcb = pcbq_dequeue(q[0])) != NULL; ) {
-        if (pcb_mangle(pcb) != 0) {
+        if (pcb_mangle(pcb)) {
             pcb_destroy(pcb);
             continue;
         }
@@ -407,18 +407,27 @@ static void thr2_pcbq_async_cb(struct ev_loop *loop, struct ev_async *w, int rev
     ev_async_send(thr1_loop, thr1_pcbq_async_ev);
 }
 static void thr1_pcbq_async_cb(struct ev_loop *loop, struct ev_async *w, int revents) {
-    struct pcbq q[1] = {STAILQ_HEAD_INITIALIZER(q[0])};
+    if (!ev_is_active(thr1_psend_ev))
+        ev_io_start(thr1_loop, thr1_psend_ev);
+}
+static void thr1_psend_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
+    static struct pcbq q[1] = {STAILQ_HEAD_INITIALIZER(q[0])};
 
-    pthread_mutex_lock(pcbq_mtx[1]);
-    pcbq_swap(pcbq[1], q);
-    pthread_mutex_unlock(pcbq_mtx[1]);
+    if (pcbq_isempty(q)) {
+        pthread_mutex_lock(pcbq_mtx[1]);
+        pcbq_concat(q, pcbq[1]);
+        pthread_mutex_unlock(pcbq_mtx[1]);
+    }
     for (struct pcb *pcb;;) {
         pcb = pcbq_dequeue(q);
-        if (!pcb)
+        if (!pcb) {
+            ev_io_stop(loop, w);
             break;
+        }
         if (pcap_inject(ifcap[1], pcb->pkt, pcb->len) == PCAP_ERROR)
             elog("pcap_inject(): %s.\n", pcap_geterr(ifcap[1]));
         pcb_destroy(pcb);
+        break;
     }
 }
 
